@@ -1,9 +1,11 @@
 # ============================================================
-#   FRIEND BGMI TOOL — ULTIMATE MASTER ENGINE (MAX POWER)
+#   FRIEND BGMI TOOL — ULTIMATE MASTER ENGINE (BEAST LEVEL)
 #   STANDARDIZED BRANDING — TACTICAL FULL ENGINE
 #   NO FAKE SUCCESS | FULL ERROR REPORTING | ZERO IN-GAME LAG
 #   UPGRADE A-F: ORIGINAL-FILE DUMP / ANY-PAK / LUA DECODE /
 #                OBB BLOB / HASH-VERIFY / NESTED SCAN / SAFE REPACK
+#   BEAST v2: STEALTH REPACK (SIZE-TRACK DEFEAT) / AXML DECODER /
+#             SQLITE READABLE / REPEAT-XOR BREAKER / CONTENT-MASK
 # ============================================================
 
 import itertools as it
@@ -347,6 +349,26 @@ class PakCrypto:
             out[n] = data[n] ^ S[(S[i] + S[j]) & 0xFF]
         return bytes(out)
     @staticmethod
+    def xor_key(data: bytes, key: bytes) -> bytes:
+        if not key: return data
+        if len(key) == 1:
+            k = key[0]
+            return bytes(b ^ k for b in data)
+        kl = len(key)
+        return bytes(b ^ key[i % kl] for i, b in enumerate(data))
+    @staticmethod
+    def content_mask_candidates(file: PurePath, em: int) -> List[bytes]:
+        """Whole-region XOR masks tried when hash-verify fails (whole-file obfuscation defeat)."""
+        stem = file.stem.lower()
+        cands = [b'\x00', b'\xff']
+        try:
+            cands.append(SHA1.new(stem.encode()).digest()[:4])
+            cands.append(SHA1.new((stem + str(em)).encode()).digest()[:4])
+            cands.append(SHA1.new((file.name).encode()).digest()[:4])
+        except Exception:
+            pass
+        return cands
+    @staticmethod
     def rsa_extract(sig: bytes, mod: bytes) -> bytes:
         c = int.from_bytes(sig, 'little'); n = int.from_bytes(mod, 'little')
         m = pow(c, 65537, n).to_bytes(256, 'little').rstrip(b'\x00')
@@ -494,6 +516,218 @@ def _zip_bounds(buf: bytes):
     if start < 0: start = cd_off
     return start, eocd + 22
 
+# ==================== ANDROID BINARY XML (AXML) DECODER ====================
+
+_ATTR_TYPES = {0x01: 'dec', 0x03: 'hex', 0x04: 'bool', 0x05: 'str', 0x06: 'float',
+               0x10: 'fraction', 0x11: 'dimension', 0x1c: 'color', 0x02: 'dec', 0x12: 'dimension'}
+
+def _u16(b, o): return struct.unpack_from('<H', b, o)[0]
+def _u32(b, o): return struct.unpack_from('<I', b, o)[0]
+
+class _AXMLStrings:
+    def __init__(self, data, base, header_size, chunk_size):
+        self.data = data; self.base = base
+        self.count = _u32(data, base + 8); self.flags = _u32(data, base + 16)
+        self.start = _u32(data, base + 20)
+        offs = header_size
+        self.offsets = [_u32(data, base + offs + 4 * i) for i in range(self.count)]
+        self.storage = base + self.start
+        self.utf8 = bool(self.flags & 0x100)
+    def _utf8_len(self, p):
+        b = self.data[p]; p += 1
+        if b & 0x80:
+            b = ((b & 0x7F) << 8) | self.data[p]; p += 1
+        return b, p
+    def get(self, idx):
+        if idx == 0xFFFFFFFF or idx < 0 or idx >= self.count: return ''
+        try:
+            p = self.storage + self.offsets[idx]
+            if self.utf8:
+                n1, p = self._utf8_len(p); n2, p = self._utf8_len(p)
+                n = n1 + n2
+                s = self.data[p:p + n].decode('utf-8', 'replace')
+            else:
+                n = _u16(self.data, p); p += 2
+                s = self.data[p:p + n * 2].decode('utf-16le', 'replace')
+            return s.rstrip('\x00')
+        except Exception:
+            return ''
+
+def _xml_escape(s): return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+def decode_axml(data: bytes) -> str:
+    if len(data) < 12: raise ValueError('too small')
+    if _u16(data, 0) != 0x0003: raise ValueError('not AXML')
+    sp_base = 8
+    sp_type = _u16(data, sp_base)
+    if sp_type != 0x0001: raise ValueError('no string pool')
+    strings = _AXMLStrings(data, sp_base, _u16(data, sp_base + 2), _u32(data, sp_base + 4))
+    pos = sp_base + _u32(data, sp_base + 4)
+    res_map = {}
+    if pos + 8 <= len(data) and _u16(data, pos) == 0x0180:
+        pos += 8
+        n = (_u32(data, pos - 4) - 8) // 4
+        for i in range(n):
+            ri = _u32(data, pos + 4 * i)
+            if ri not in ('', None): res_map[i] = ri
+        pos = pos - 8 + _u32(data, pos - 4)
+    namespaces = []
+    stack = []
+    out = []
+    depth = 0
+
+    def ns_name(idx):
+        nm = strings.get(idx)
+        if not nm: return ''
+        for p, u in namespaces:
+            if p == nm: return nm
+        return nm.split('/')[-1]
+
+    while pos + 8 <= len(data):
+        typ = _u16(data, pos); hsize = _u16(data, pos + 2); csize = _u32(data, pos + 4)
+        if typ == 0x0100:
+            namespaces.append((strings.get(_u32(data, pos + 8)), strings.get(_u32(data, pos + 12))))
+        elif typ == 0x0101:
+            if namespaces: namespaces.pop()
+        elif typ == 0x0102:
+            ns_i = _u32(data, pos + 20); name_i = _u32(data, pos + 24)
+            acount = _u16(data, pos + 32); asize = _u16(data, pos + 30) or 20
+            tag = strings.get(name_i)
+            stack.append(tag)
+            if depth == 0:
+                out.append('<?xml version="1.0" encoding="utf-8"?>')
+                resns = next((u for p, u in namespaces if p == 'android'), 'http://schemas.android.com/apk/res/android')
+                out.append('<%s xmlns:android="%s">' % (tag, resns))
+            else:
+                out.append('  ' * depth + '<%s>' % tag)
+            ap = pos + 36
+            for ai in range(acount):
+                a = ap + ai * asize
+                ans = _u32(data, a); aname = _u32(data, a + 4); araw = _u32(data, a + 8)
+                dtype = data[a + 14]; ddata = _u32(data, a + 16)
+                attr = strings.get(aname)
+                prefix = 'android:' if ans != 0xFFFFFFFF and strings.get(ans) else ''
+                if araw != 0xFFFFFFFF:
+                    val = strings.get(araw)
+                elif dtype == 0x03:
+                    val = strings.get(ddata)
+                elif dtype == 0x04:
+                    val = 'true' if ddata != 0 else 'false'
+                elif dtype == 0x06:
+                    val = str(struct.unpack('<f', struct.pack('<I', ddata))[0])
+                elif dtype == 0x01:
+                    val = str(ddata)
+                else:
+                    val = '0x%08x' % ddata
+                out.append('  ' * (depth + 1) + '%s%s="%s"' % (prefix, attr, _xml_escape(val)))
+            depth += 1
+        elif typ == 0x0103:
+            if depth > 0:
+                depth -= 1
+            if stack:
+                tag = stack.pop()
+                out.append('  ' * depth + '</%s>' % tag)
+        elif typ == 0x0104:
+            t = strings.get(_u32(data, pos + 12))
+            if t:
+                out.append('  ' * depth + _xml_escape(t))
+        pos += csize
+    return '\n'.join(out)
+
+def try_decode_axml(data: bytes):
+    try:
+        return decode_axml(data)
+    except Exception:
+        return None
+
+# ==================== READABLE ZIP / SQLITE EXTRACTION ====================
+
+def _extract_zip_readable(zf_bytes: bytes, dest: Path):
+    import io
+    with zipfile.ZipFile(io.BytesIO(zf_bytes)) as z:
+        z.extractall(dest)
+    for p in dest.rglob('*'):
+        if p.is_file() and (p.suffix.lower() == '.xml' or p.name == 'AndroidManifest.xml'):
+            try:
+                raw = p.read_bytes()
+                txt = decode_axml(raw)
+                if txt:
+                    (p.with_name(p.name + '.raw.xml')).write_bytes(raw)
+                    p.write_text('<!-- AXML decoded by FRIEND TOOL -->\n' + txt, encoding='utf-8')
+            except Exception:
+                pass
+
+def _dump_sqlite_readable(src: Path, dest: Path):
+    try:
+        import sqlite3, csv
+    except Exception:
+        return False
+    try:
+        tmp = dest / '_db_copy.db'
+        shutil.copy2(src, tmp)
+        con = sqlite3.connect(str(tmp))
+        cur = con.cursor()
+        tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()]
+        schema = []
+        for r in cur.execute("SELECT type,name,tbl_name,sql FROM sqlite_master").fetchall():
+            if r[3]: schema.append('%s;\n' % r[3])
+        (dest / 'schema.sql').write_text('\n'.join(schema), encoding='utf-8')
+        tdir = dest / 'tables'
+        tdir.mkdir(parents=True, exist_ok=True)
+        summary = []
+        for t in tables:
+            try:
+                cols = [d[1] for d in cur.execute('PRAGMA table_info("%s")' % t.replace('"', '""')).fetchall()]
+                rows = cur.execute('SELECT * FROM "%s"' % t.replace('"', '""')).fetchall()
+                with open(str(tdir / ('%s.csv' % t)), 'w', newline='', encoding='utf-8') as f:
+                    w = csv.writer(f)
+                    w.writerow(cols)
+                    for r in rows: w.writerow(['' if c is None else c for c in r])
+                summary.append('%s: %d rows, %d cols' % (t, len(rows), len(cols)))
+            except Exception as e:
+                summary.append('%s: ERROR %s' % (t, e))
+        con.close()
+        tmp.unlink(missing_ok=True)
+        (dest / 'db_summary.txt').write_text('\n'.join(summary), encoding='utf-8')
+        return True
+    except Exception:
+        return False
+
+# ==================== LUA REPEAT-XOR (MULTI-BYTE KEY) BREAKER ====================
+
+_LUA_MAGIC = b'\x1bLua'
+
+def _find_repeat_xor(data: bytes):
+    """Finds repeating-key XOR that reveals the Lua magic (key length 2 or 4)."""
+    lim = min(len(data) - 4, 256)
+    for L in (2, 4):
+        for off in range(lim):
+            key = bytearray(L)
+            ok = True
+            for i in range(4):
+                pos = off + i
+                ki = (pos - off) % L
+                kb = data[pos] ^ _LUA_MAGIC[i]
+                if key[ki] and key[ki] != kb:
+                    ok = False; break
+                key[ki] = kb
+            if not ok: continue
+            if L == 4 and not any(key): continue
+            if all(b == 0 for b in key): continue
+            dec = PakCrypto.xor_key(data[off:], bytes(key))
+            if dec[:4] != _LUA_MAGIC: continue
+            try:
+                parse_lua51(dec)
+                return off, bytes(key)
+            except Exception:
+                pass
+            hits = 0
+            for j in range(4, min(512, len(dec) - 4), 4):
+                if dec[j:j + 4] == _LUA_MAGIC: hits += 1
+            if hits >= 2 or (hits >= 1 and L == 2):
+                return off, bytes(key)
+    return None, None
+
 # ==================== TENCENT PAK FILE (ANY-PAK ENGINE) ====================
 
 class TencentPakFile:
@@ -595,43 +829,57 @@ class TencentPakFile:
         verify = not _is_all_zero(want)
         candidates = [em] + [e for e in EM_CANDIDATES if e != em]
 
-        def attempt(em_cand):
+        def attempt(em_cand, mask):
             try:
                 if cm == CM_NONE:
                     sz = PakCrypto.align_encrypted_content_size(entry.size, em_cand) if entry.encrypted else entry.size
                     data = bytes(self._file_content[entry.offset:entry.offset + sz])
-                    if entry.encrypted:
-                        data = PakCrypto.decrypt_block(data, out_path, em_cand)
-                    data = data[:entry.uncompressed_size]
+                else:
+                    order = PakCrypto.generate_block_indices(len(entry.compressed_blocks), em_cand)
+                    out = bytearray()
+                    for idx in order:
+                        blk = entry.compressed_blocks[idx]
+                        unc = blk.end - blk.start
+                        sz = PakCrypto.align_encrypted_content_size(unc, em_cand) if entry.encrypted else unc
+                        data = bytes(self._file_content[blk.start:blk.start + sz])
+                        if mask: data = PakCrypto.xor_key(data, mask)
+                        if entry.encrypted:
+                            data = PakCrypto.decrypt_block(data, out_path, em_cand)
+                        dec = PakCompression.decompress_block(data, self._zstd_dict, cm)
+                        out += dec
+                    data = bytes(out)
                     return data, 'DECRYPT_OK'
-                order = PakCrypto.generate_block_indices(len(entry.compressed_blocks), em_cand)
-                out = bytearray()
-                for idx in order:
-                    blk = entry.compressed_blocks[idx]
-                    unc = blk.end - blk.start
-                    sz = PakCrypto.align_encrypted_content_size(unc, em_cand) if entry.encrypted else unc
-                    data = bytes(self._file_content[blk.start:blk.start + sz])
-                    if entry.encrypted:
-                        data = PakCrypto.decrypt_block(data, out_path, em_cand)
-                    dec = PakCompression.decompress_block(data, self._zstd_dict, cm)
-                    out += dec
-                return bytes(out), 'DECRYPT_OK'
+                if mask: data = PakCrypto.xor_key(data, mask)
+                if entry.encrypted:
+                    data = PakCrypto.decrypt_block(data, out_path, em_cand)
+                data = data[:entry.uncompressed_size]
+                return data, 'DECRYPT_OK'
             except Exception:
                 return None, 'DECRYPT_FAIL'
 
-        for em_cand in candidates:
-            data, st = attempt(em_cand)
-            if data is None: continue
-            if verify and SHA1.new(data).digest() == want:
-                out_path.write_bytes(data)
-                return 'HASH_OK'
-            if not verify:
-                if data is not None:
+        em_cands = candidates
+        masks = [None]
+        for em_cand in em_cands:
+            for mask in masks:
+                data, st = attempt(em_cand, mask)
+                if data is None: continue
+                if verify and SHA1.new(data).digest() == want:
+                    out_path.write_bytes(data)
+                    return 'HASH_OK'
+                if not verify and data is not None:
                     out_path.write_bytes(data)
                     return 'DECRYPT_OK'
-
-        # Salvage: best-effort with original method
-        data, st = attempt(em)
+        # whole-region XOR obfuscation fallback
+        if entry.encrypted:
+            masks = PakCrypto.content_mask_candidates(out_path, em)
+            for mask in masks:
+                for em_cand in em_cands:
+                    data, st = attempt(em_cand, mask)
+                    if data is None: continue
+                    if verify and SHA1.new(data).digest() == want:
+                        out_path.write_bytes(data)
+                        return 'HASH_OK'
+        data, st = attempt(em, None)
         if data is not None and len(data):
             out_path.write_bytes(data)
             return 'RAW_SALVAGED'
@@ -710,12 +958,13 @@ def _dump_one_bytes(data: bytes, name: str, dest: Path, depth: int, max_depth: i
                 if b:
                     start, end = b
                     zf = data[start:end]
-            import io
-            with zipfile.ZipFile(io.BytesIO(zf)) as z:
-                z.extractall(dest / 'EXTRACTED')
+            _extract_zip_readable(zf, dest / 'EXTRACTED')
             for p in Path(dest / 'EXTRACTED').rglob('*'):
                 if p.is_file():
                     _nested_dump(p, dest / 'EXTRACTED', depth, max_depth)
+        elif kind == 'SQLITE':
+            (dest / 'sqlite.db').write_bytes(data)
+            _dump_sqlite_readable(dest / 'sqlite.db', dest)
         elif kind.startswith('LUA'):
             _process_lua_file(data, dest, name)
     except Exception:
@@ -838,6 +1087,9 @@ def _scan_lua(data: bytes):
 def _unscramble_lua(data: bytes):
     off, key = _scan_lua(data)
     if off is None:
+        off, key = _find_repeat_xor(data)
+        if off is not None and key is not None:
+            return PakCrypto.xor_key(data[off:], key), list(key), off
         return data, None, 0
     if key is None:
         return data[off:], None, off
@@ -927,7 +1179,10 @@ def _repack_lua(dest_dir: Path, base_name: str, out_path: Path) -> bool:
 
     rebuild = payload
     if key is not None:
-        rebuild = bytes(b ^ key for b in payload)
+        if isinstance(key, list):
+            rebuild = PakCrypto.xor_key(payload, bytes(key))
+        else:
+            rebuild = bytes(b ^ key for b in payload)
     if prefix:
         rebuild = raw.read_bytes()[:prefix] + rebuild
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -936,7 +1191,7 @@ def _repack_lua(dest_dir: Path, base_name: str, out_path: Path) -> bool:
 
 # ==================== REPACK ENGINE (FULL IN-PLACE REBUILD, SAFE) ====================
 
-def repack_pak_file_full(pak_file, edited_root, output_path, target_path=None, force_add=False, self_test=True):
+def repack_pak_file_full(pak_file, edited_root, output_path, target_path=None, force_add=False, self_test=True, stealth=True):
     import copy as _cp
     edit_files = [p for p in Path(edited_root).rglob('*') if p.is_file() and not p.name.endswith(('.txt', '.json', '.md', '.raw', '.cleaned'))]
     if not edit_files:
@@ -948,6 +1203,7 @@ def repack_pak_file_full(pak_file, edited_root, output_path, target_path=None, f
     version = pak_file._pak_info.version
     keystream = pak_file._keystream  # same ZUC pair that loaded the file
     orig_fc = pak_file._file_content
+    orig_total = len(bytes(pak_file._file_content))
 
     raw = bytes(pak_file._file_content[pak_file._pak_info.index_offset:][:pidx_check(pak_file._pak_info)])
     if pak_file._pak_info.index_encrypted: raw = PakCrypto.decrypt_index(raw, pak_file._pak_info)
@@ -1017,9 +1273,22 @@ def repack_pak_file_full(pak_file, edited_root, output_path, target_path=None, f
                 else:
                     cs = old_entry.compression_block_size if old_entry.compression_block_size > 0 else 65536
                     chunks = [new_raw[i:i+cs] for i in range(0, len(new_raw), cs)]
+                    target_total = old_entry.size  # keep compressed size close to original (anti size-track)
+                    chosen_comps = None
+                    if cm in (CM_ZLIB, CM_ZSTD, CM_ZSTD_DICT) and target_total > 0:
+                        levels = [6, 3, 9, 12, 19, 1, 22] if cm != CM_ZLIB else [6, 9, 1]
+                        best = None; bd = None
+                        for lv in levels:
+                            comps = [PakCompression.compress_block(chk, pak_file._zstd_dict, cm, level=lv) for chk in chunks]
+                            total = sum(len(c) for c in comps)
+                            d = abs(total - target_total)
+                            if bd is None or d < bd:
+                                bd = d; best = comps
+                        chosen_comps = best
+                    if chosen_comps is None:
+                        chosen_comps = [PakCompression.compress_block(chk, pak_file._zstd_dict, cm) for chk in chunks]
                     new_blks = []
-                    for chk in chunks:
-                        comp = PakCompression.compress_block(chk, pak_file._zstd_dict, cm)
+                    for comp in chosen_comps:
                         if enc:
                             comp = PakCrypto.encrypt_block(comp, p, em)
                         b = PakCompressedBlock.__new__(PakCompressedBlock)
@@ -1075,6 +1344,15 @@ def repack_pak_file_full(pak_file, edited_root, output_path, target_path=None, f
 
     new_idx_offset = len(out_buf)
     new_idx_size = len(idx_bytes)
+    footer_len = TencentPakInfo._mem_size(version)
+    size_delta = 0
+    if stealth:
+        filler = orig_total - (len(out_buf) + len(idx_bytes) + footer_len)
+        if filler > 0:
+            out_buf += b'\x00' * filler
+            new_idx_offset = len(out_buf)
+        else:
+            size_delta = -filler
     out_buf += idx_bytes
 
     footer = bytearray(orig_fc[-TencentPakInfo._mem_size(version):])
@@ -1086,6 +1364,15 @@ def repack_pak_file_full(pak_file, edited_root, output_path, target_path=None, f
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, 'wb') as f: f.write(out_buf)
+
+    if stealth:
+        new_total = len(out_buf)
+        if new_total == orig_total:
+            console.print(f'[bold green]🛡 Stealth OK: total size identical to original ({new_total} bytes) — size-track won\'t detect change[/bold green]')
+        elif new_total < orig_total:
+            console.print(f'[bold green]🛡 Stealth: size {new_total} (smaller by {orig_total - new_total} bytes, padded) — size-track bypassed[/bold green]')
+        else:
+            console.print(f'[bold yellow]🛡 Stealth WARN: size grew by {new_total - orig_total} bytes (edited assets are bigger than originals). Game may detect MB-size change — keep edits small or re-edit with similar-size data.[/bold yellow]')
 
     if self_test:
         try:
@@ -1154,8 +1441,7 @@ def _dump_universal(src: Path, dest_dir: Path) -> Tuple[Path, str]:
                 (dest / 'meta.json').write_text(json.dumps({'source': src.name, 'type': 'OBB_BLOB'}))
                 return dest, 'OBB_BLOB'
         import io
-        with zipfile.ZipFile(io.BytesIO(zf)) as z:
-            z.extractall(dest / 'EXTRACTED')
+        _extract_zip_readable(zf, dest / 'EXTRACTED')
         for p in Path(dest / 'EXTRACTED').rglob('*'):
             if p.is_file():
                 _nested_dump(p, dest / 'EXTRACTED', 0, 2)
@@ -1169,9 +1455,10 @@ def _dump_universal(src: Path, dest_dir: Path) -> Tuple[Path, str]:
 
     if kind == 'SQLITE':
         (dest / src.name).write_bytes(data)
+        _dump_sqlite_readable(dest / src.name, dest)
         (dest / 'meta.json').write_text(json.dumps({'source': src.name, 'type': 'SQLITE'}))
         for p in Path(dest).rglob('*'):
-            if p.is_file(): _nested_dump(p, dest, 0, 2)
+            if p.is_file() and p.suffix.lower() in ('.pak', '.lua', '.obb'): _nested_dump(p, dest, 0, 2)
         return dest, 'SQLITE'
 
     (dest / src.name).write_bytes(data)
@@ -1202,6 +1489,8 @@ def _repack_universal(dump_dir: Path, result_dir: Path):
                     fp = Path(root) / fn
                     arc = str(fp.relative_to(ext_dir))
                     if '__nested__' in arc: continue
+                    if arc.endswith('.raw.xml'): continue
+                    if '_db_copy.db' in arc or arc == 'STATUS.txt': continue
                     z.write(fp, arcname=arc)
         if dtype == 'OBB_BLOB':
             blob = (dump_dir / '_blob.bin').read_bytes() if (dump_dir / '_blob.bin').exists() else None
@@ -1219,6 +1508,13 @@ def _repack_universal(dump_dir: Path, result_dir: Path):
             shutil.copy2(tmp_zip, out_file)
             tmp_zip.unlink(missing_ok=True)
         return True, str(out_file)
+
+    if dtype == 'SQLITE':
+        src_bin = dump_dir / orig_name
+        if src_bin.exists():
+            shutil.copy2(src_bin, out_file)
+            return True, str(out_file)
+        return False, 'SQLITE repack: original db not found in dump.'
 
     if dtype in ('BIN', 'LUA58', 'LUA_TEXT', 'LUA51', 'LUA52', 'LUA53', 'LUA54', 'LUJIT'):
         if dtype.startswith('LUA'):
