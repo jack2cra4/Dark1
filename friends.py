@@ -1016,13 +1016,13 @@ class Lua51Parser:
             elif tag == 4: consts.append(self.string())
             else: consts.append(('unknown', tag))
         nup = self.u4(); upvals = [self.u1() for _ in range(nup)]
-        np = self.u4(); protos = [self.proto(src) for _ in range(np)]
         ninfo = self.u4()
         for _ in range(ninfo): self.u4()
         nloc = self.u4()
         for _ in range(nloc): self.string(); self.u4(); self.u4()
         nupd = self.u4()
         for _ in range(nupd): self.string()
+        np = self.u4(); protos = [self.proto(src) for _ in range(np)]
         return {
             'src': src, 'linedefined': linedefined, 'lastlinedefined': lastlinedefined,
             'nups': nups, 'numparams': numparams, 'is_vararg': is_vararg, 'maxstack': maxstack,
@@ -1034,9 +1034,16 @@ def parse_lua51(data: bytes, offset: int = 0):
         raise ValueError('Not a Lua 5.1 chunk')
     if data[offset + 4] != 0x51:
         raise ValueError('Not Lua 5.1 version')
-    p = Lua51Parser(data, offset + 12)
-    proto = p.proto(None)
-    return proto, p.p
+    last_err = None
+    for start in (offset + 20, offset + 12):
+        try:
+            p = Lua51Parser(data, start)
+            proto = p.proto(None)
+            return proto, p.p
+        except Exception as e:
+            last_err = e
+            continue
+    raise ValueError('Lua 5.1 parse failed: %s' % last_err)
 
 def _disasm51(code, k, indent=''):
     out = []
@@ -1109,61 +1116,73 @@ def _lua_report(kind: str, data: bytes) -> List[str]:
         lines.append('NOTE: full %s decompiler requires per-version opcode/varint tables; strings table below for auditing.' % ver)
     return lines
 
-def _process_lua_file(data: bytes, dest_dir: Path, base_name: str):
-    """Parses Lua scripts or compiled bytecode into fully readable files."""
+def _process_lua_file(data: bytes, dest_dir: Path, base_name: str, full: bool = False):
+    """Parses Lua scripts/bytecode. full=False -> single readable file (+ .raw for repack)."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     cleaned, xor_key, prefix_len = _unscramble_lua(data)
     kind = detect_container(cleaned, base_name)
+    main = dest_dir / base_name
 
     if kind == 'LUA_TEXT':
-        txt = cleaned.decode('utf-8', 'replace')
-        (dest_dir / 'readable_script.lua').write_text(txt, encoding='utf-8')
+        main.write_text(cleaned.decode('utf-8', 'replace'), encoding='utf-8')
         (dest_dir / 'meta.json').write_text(json.dumps({'type': 'LUA_TEXT', 'xor_key': xor_key, 'prefix': prefix_len}))
         return
 
-    # Save cleaned (decrypted) bytecode + raw original
-    (dest_dir / ('%s.cleaned' % str(base_name))).write_bytes(cleaned)
     (dest_dir / ('%s.raw' % str(base_name))).write_bytes(data)
-
     header_info = []
+    body_lines = []
+
     if kind in ('LUA52', 'LUA53', 'LUA54', 'LUJIT'):
         header_info = _lua_report(kind, cleaned)
-        header_info.append('Encryption/obfuscation broken: XOR key=%r prefix=%d' % (xor_key, prefix_len))
+        body_lines = ['-- ' + h if not h.startswith('--') else h for h in header_info]
+        body_lines += ['-- Encryption broken: XOR key=%r prefix=%d' % (xor_key, prefix_len)]
+        body_lines += ['-- String table:']
+        for s in _extract_strings_clean(cleaned):
+            body_lines.append('-- string_entry = "%s"' % s)
     elif kind == 'LUA51':
+        body_lines.append('-- FRIEND TOOL Lua 5.1 decode / editable view')
         try:
             proto, end = parse_lua51(cleaned)
-            disasm = []
-            def walk(p, ind):
-                disasm.append('; ---- function %s (line %d-%d) params=%d stack=%d' % (
-                    p.get('src') or '<main>', p.get('linedefined', 0), p.get('lastlinedefined', 0),
-                    p.get('numparams', 0), p.get('maxstack', 0)))
-                disasm.extend(_disasm51(p.get('code', []), p.get('k', []), ind))
-                for s in p.get('protos', []): walk(s, ind + '  ')
-            walk(proto, '')
-            (dest_dir / 'decode_5_1_disasm.txt').write_text('\n'.join(disasm), encoding='utf-8')
-            pseudo = _render_pseudo51(proto)
-            (dest_dir / 'editable_view.lua').write_text('\n--- EDITABLE PSEUDO-SOURCE (Lua 5.1) ---\n' + '\n'.join(pseudo), encoding='utf-8')
-            header_info.append('Lua 5.1 fully parsed: end=%d, top constants=%d, top instructions=%d' % (end, len(proto.get('k', [])), len(proto.get('code', []))))
-            header_info.append('Encryption/obfuscation broken: XOR key=%r prefix=%d' % (xor_key, prefix_len))
+            header_info.append('Lua 5.1 parsed: end=%d top_instructions=%d top_constants=%d' % (end, len(proto.get('code', [])), len(proto.get('k', []))))
+            header_info.append('Encryption broken: XOR key=%r prefix=%d' % (xor_key, prefix_len))
+            body_lines = ['-- ' + h for h in header_info]
+            body_lines += _render_pseudo51(proto)
         except Exception as e:
-            header_info.append('Lua 5.1 parse error: %s' % e)
+            body_lines.append('-- parse error: %s' % e)
+            body_lines += _extract_strings_clean(cleaned)
+    else:
+        body_lines.append('-- unknown Lua container: %s' % kind)
+        body_lines += _extract_strings_clean(cleaned)
 
-    strings = [m.group(0).decode('ascii', errors='replace') for m in re.finditer(rb'[\x20-\x7e]{3,}', cleaned)]
-    (dest_dir / 'strings_readable.txt').write_text('\n'.join(header_info) + '\n\n' + '\n'.join(strings), encoding='utf-8')
-    (dest_dir / 'meta.json').write_text(json.dumps({'type': kind, 'xor_key': xor_key, 'prefix': prefix_len}))
+    main.write_text('\n'.join(body_lines), encoding='utf-8')
+    (dest_dir / 'meta.json').write_text(json.dumps({'type': kind, 'xor_key': xor_key, 'prefix': prefix_len, 'full': full}))
+
+    if full:
+        # Rich mode: sidecar audit files (option 7 asks for these)
+        if kind == 'LUA51':
+            try:
+                proto, end = parse_lua51(cleaned)
+                dis = []
+                def walk(p, ind):
+                    dis.append('; ---- function %s (line %d-%d)' % (p.get('src') or '<main>', p.get('linedefined', 0), p.get('lastlinedefined', 0)))
+                    dis.extend(_disasm51(p.get('code', []), p.get('k', []), ind))
+                    for s in p.get('protos', []): walk(s, ind + '  ')
+                walk(proto, '')
+                (dest_dir / 'decode_5_1_disasm.txt').write_text('\n'.join(dis), encoding='utf-8')
+            except Exception:
+                pass
+        (dest_dir / 'strings_readable.txt').write_text('\n'.join(_extract_strings_clean(cleaned)), encoding='utf-8')
+
+def _extract_strings_clean(data: bytes):
+    return [m.group(0).decode('ascii', errors='replace') for m in re.finditer(rb'[\x20-\x7e]{3,}', data)]
 
 def _repack_lua(dest_dir: Path, base_name: str, out_path: Path) -> bool:
     raw = dest_dir / ('%s.raw' % str(base_name))
-    cleaned = dest_dir / ('%s.cleaned' % str(base_name))
     if not raw.exists():
         return False
-    meta = json.loads((dest_dir / 'meta.json').read_text()) if (dest_dir / 'meta.json').exists() else {}
-    key = meta.get('xor_key')
-    prefix = meta.get('prefix', 0)
+    raw_bytes = raw.read_bytes()
+    payload, key, prefix = _unscramble_lua(raw_bytes)
 
-    payload = cleaned.read_bytes() if cleaned.exists() else raw.read_bytes()
-
-    # Optional string-patch manifest: length-preserving byte replacement
     patch_f = dest_dir / 'patch.json'
     if patch_f.exists():
         try:
@@ -1184,7 +1203,7 @@ def _repack_lua(dest_dir: Path, base_name: str, out_path: Path) -> bool:
         else:
             rebuild = bytes(b ^ key for b in payload)
     if prefix:
-        rebuild = raw.read_bytes()[:prefix] + rebuild
+        rebuild = raw_bytes[:prefix] + rebuild
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(rebuild)
     return True
@@ -1245,6 +1264,7 @@ def repack_pak_file_full(pak_file, edited_root, output_path, target_path=None, f
     new_files = [_cp.copy(e) for e in pak_file._files]
     old_to_new = {id(pak_file._files[i]): new_files[i] for i in range(len(pak_file._files))}
     out_buf = bytearray()
+    stealth_delta = []
 
     for dp_str, dir_files in list(all_dirs.items()):
         for name, old_entry in list(dir_files.items()):
@@ -1270,9 +1290,15 @@ def repack_pak_file_full(pak_file, edited_root, output_path, target_path=None, f
                     ne.offset = len(out_buf)
                     ne.size = len(cipher)
                     out_buf += cipher
+                    stealth_delta.append((full_path, ne.size - old_entry.size, 0))
                 else:
-                    cs = old_entry.compression_block_size if old_entry.compression_block_size > 0 else 65536
+                    orig_blk = max(1, len(old_entry.compressed_blocks))
+                    cs = old_entry.compression_block_size if old_entry.compression_block_size > 0 else max(1, math.ceil(len(new_raw) / orig_blk))
                     chunks = [new_raw[i:i+cs] for i in range(0, len(new_raw), cs)]
+                    if len(chunks) != orig_blk:
+                        cs2 = max(1, math.ceil(len(new_raw) / orig_blk))
+                        chunks = [new_raw[i:i+cs2] for i in range(0, len(new_raw), cs2)]
+                        chunks = (chunks + [b''] * orig_blk)[:orig_blk]
                     target_total = old_entry.size  # keep compressed size close to original (anti size-track)
                     chosen_comps = None
                     if cm in (CM_ZLIB, CM_ZSTD, CM_ZSTD_DICT) and target_total > 0:
@@ -1298,6 +1324,7 @@ def repack_pak_file_full(pak_file, edited_root, output_path, target_path=None, f
                     ne.compressed_blocks = new_blks
                     ne.offset = new_blks[0].start if new_blks else len(out_buf)
                     ne.size = sum(b.end - b.start for b in new_blks)
+                    stealth_delta.append((full_path, ne.size - old_entry.size, len(new_blks) - len(old_entry.compressed_blocks)))
                 console.print(f'[green]✓ Processed & Sealed: {full_path}[/green]')
             else:
                 if cm == CM_NONE:
@@ -1367,12 +1394,34 @@ def repack_pak_file_full(pak_file, edited_root, output_path, target_path=None, f
 
     if stealth:
         new_total = len(out_buf)
+        rep = ['FRIEND TOOL — STEALTH REPACK REPORT', '='*46,
+               'Source PAK   : %s' % (pak_file._pak_info.mp_name or ''),
+               'Total blocks : %d -> %d' % (sum(len(e.compressed_blocks) for e in pak_file._files), sum(len(e.compressed_blocks) for e in new_files)),
+               'Size         : %d -> %d  (delta %+d bytes)' % (orig_total, new_total, new_total - orig_total)]
         if new_total == orig_total:
-            console.print(f'[bold green]🛡 Stealth OK: total size identical to original ({new_total} bytes) — size-track won\'t detect change[/bold green]')
+            rep.append('STATUS       : 🛡 BYPASS — exact same total size, game size-track defeated')
         elif new_total < orig_total:
-            console.print(f'[bold green]🛡 Stealth: size {new_total} (smaller by {orig_total - new_total} bytes, padded) — size-track bypassed[/bold green]')
+            rep.append('STATUS       : 🛡 BYPASS — padded back to original size, game size-track defeated')
         else:
-            console.print(f'[bold yellow]🛡 Stealth WARN: size grew by {new_total - orig_total} bytes (edited assets are bigger than originals). Game may detect MB-size change — keep edits small or re-edit with similar-size data.[/bold yellow]')
+            rep.append('STATUS       : ⚠ GROWN (+%d bytes) — edit smaller data or game may detect' % (new_total - orig_total))
+        rep.append('-'*46)
+        rep.append('Per-file order vs original (path | size delta | block-count delta):')
+        worst = 0
+        for fp, dsize, dblk in stealth_delta:
+            worst = max(worst, dsize)
+            rep.append('  %s | %+d B | %+d blocks' % (fp, dsize, dblk))
+        try:
+            rep_out = output_path.parent / 'STEALTH_REPORT.txt'
+            rep_out.parent.mkdir(parents=True, exist_ok=True)
+            rep_out.write_text('\n'.join(rep), encoding='utf-8')
+            rep.append('')
+            rep.append('Full report saved: %s' % rep_out)
+        except Exception:
+            pass
+        for ln in rep:
+            console.print(ln)
+        if worst == 0:
+            console.print('[bold green]🛡 Every edited file keeps its original byte-count — undetectable at file level.[/bold green]')
 
     if self_test:
         try:
@@ -1409,7 +1458,35 @@ def pidx_check(pi) -> int:
 
 # ==================== UNIVERSAL DUMP & REPACK (ALL ASSETS) ====================
 
-def _dump_universal(src: Path, dest_dir: Path) -> Tuple[Path, str]:
+def _curate_tree(root: Path):
+    """Park UI-noise artifacts (decoded-duplicates, temp copies) into root/_debug
+    so the dump stays ONE clean folder with the meaningful files only."""
+    try:
+        dbg = root / '_debug'
+        dbg.mkdir(exist_ok=True)
+        for p in list(root.rglob('*')):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(root)
+            if rel.parts and rel.parts[0] in ('_debug', '__nested__'):
+                continue
+            low = p.name.lower()
+            drop = (low.endswith('.cleaned') or low.endswith('.raw.xml')
+                    or low in ('original.bin', 'blob_header.hex', '_pack.bin', '_db_copy.db', 'strings_readable.txt', '_blob.bin'))
+            if drop:
+                tgt = dbg.joinpath(*rel)
+                tgt.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(p), str(tgt))
+    except Exception:
+        pass
+    try:
+        if dbg.exists() and not any(dbg.rglob('*')):
+            dbg.rmdir()
+    except Exception:
+        pass
+    return root
+
+def _dump_universal(src: Path, dest_dir: Path, rich: bool = False) -> Tuple[Path, str]:
     dest = dest_dir / src.stem
     if dest.exists(): shutil.rmtree(dest)
     dest.mkdir(parents=True)
@@ -1425,6 +1502,7 @@ def _dump_universal(src: Path, dest_dir: Path) -> Tuple[Path, str]:
         for p in Path(dest).rglob('*'):
             if p.is_file() and p.suffix.lower() in ('.pak', '.lua', '.obb'):
                 _nested_dump(p, dest, 0, 2)
+        _curate_tree(dest)
         return dest, 'PAK'
 
     if kind in ('ZIP', 'OBB_BLOB'):
@@ -1439,6 +1517,7 @@ def _dump_universal(src: Path, dest_dir: Path) -> Tuple[Path, str]:
                 (dest / 'blob_header.hex').write_text(data[:512].hex(), encoding='utf-8')
                 (dest / src.name).write_bytes(data)
                 (dest / 'meta.json').write_text(json.dumps({'source': src.name, 'type': 'OBB_BLOB'}))
+                _curate_tree(dest)
                 return dest, 'OBB_BLOB'
         import io
         _extract_zip_readable(zf, dest / 'EXTRACTED')
@@ -1446,11 +1525,13 @@ def _dump_universal(src: Path, dest_dir: Path) -> Tuple[Path, str]:
             if p.is_file():
                 _nested_dump(p, dest / 'EXTRACTED', 0, 2)
         (dest / 'meta.json').write_text(json.dumps({'source': src.name, 'type': 'OBB_BLOB' if kind == 'OBB_BLOB' else 'ZIP'}))
+        _curate_tree(dest)
         return dest, 'OBB_BLOB' if kind == 'OBB_BLOB' else 'ZIP_CONTAINER'
 
     if kind.startswith('LUA') or kind == 'LUA_TEXT':
-        _process_lua_file(data, dest, src.name)
+        _process_lua_file(data, dest, src.name, full=rich)
         (dest / 'meta.json').write_text(json.dumps({'source': src.name, 'type': kind}))
+        _curate_tree(dest)
         return dest, 'LUA_SCRIPT'
 
     if kind == 'SQLITE':
@@ -1459,6 +1540,7 @@ def _dump_universal(src: Path, dest_dir: Path) -> Tuple[Path, str]:
         (dest / 'meta.json').write_text(json.dumps({'source': src.name, 'type': 'SQLITE'}))
         for p in Path(dest).rglob('*'):
             if p.is_file() and p.suffix.lower() in ('.pak', '.lua', '.obb'): _nested_dump(p, dest, 0, 2)
+        _curate_tree(dest)
         return dest, 'SQLITE'
 
     (dest / src.name).write_bytes(data)
@@ -1468,6 +1550,7 @@ def _dump_universal(src: Path, dest_dir: Path) -> Tuple[Path, str]:
         if p.is_file() and not p.name.endswith(('.txt', '.json')):
             _nested_dump(p, dest, 0, 2)
     (dest / 'meta.json').write_text(json.dumps({'source': src.name, 'type': 'BIN'}))
+    _curate_tree(dest)
     return dest, 'RAW_BINARY'
 
 def _repack_universal(dump_dir: Path, result_dir: Path):
@@ -1519,6 +1602,10 @@ def _repack_universal(dump_dir: Path, result_dir: Path):
     if dtype in ('BIN', 'LUA58', 'LUA_TEXT', 'LUA51', 'LUA52', 'LUA53', 'LUA54', 'LUJIT'):
         if dtype.startswith('LUA'):
             if dtype == 'LUA_TEXT':
+                txt = dump_dir / orig_name
+                if txt.exists():
+                    shutil.copy2(txt, out_file)
+                    return True, str(out_file)
                 txt = dump_dir / 'readable_script.lua'
                 if txt.exists():
                     shutil.copy2(txt, out_file)
