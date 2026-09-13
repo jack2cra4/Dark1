@@ -679,10 +679,14 @@ def _dump_sqlite_readable(src: Path, dest: Path):
             try:
                 cols = [d[1] for d in cur.execute('PRAGMA table_info("%s")' % t.replace('"', '""')).fetchall()]
                 rows = cur.execute('SELECT * FROM "%s"' % t.replace('"', '""')).fetchall()
+                def _kv(v):
+                    if v is None: return ''
+                    if isinstance(v, bytes): return '\\x' + v.hex()
+                    return str(v)
                 with open(str(tdir / ('%s.csv' % t)), 'w', newline='', encoding='utf-8') as f:
                     w = csv.writer(f)
                     w.writerow(cols)
-                    for r in rows: w.writerow(['' if c is None else c for c in r])
+                    for r in rows: w.writerow([_kv(c) for c in r])
                 summary.append('%s: %d rows, %d cols' % (t, len(rows), len(cols)))
             except Exception as e:
                 summary.append('%s: ERROR %s' % (t, e))
@@ -691,6 +695,89 @@ def _dump_sqlite_readable(src: Path, dest: Path):
         (dest / 'db_summary.txt').write_text('\n'.join(summary), encoding='utf-8')
         return True
     except Exception:
+        return False
+
+def _rebuild_sqlite(dump_dir: Path, orig_name: str, out_path: Path) -> bool:
+    """Re-builds the real database file from the dumped schema.sql + tables/*.csv
+    so SQLite repacks actually carry your CSV edits (no more copy-back of the original)."""
+    try:
+        import sqlite3, csv
+    except Exception:
+        return False
+    schema_p = dump_dir / 'schema.sql'
+    tdir = dump_dir / 'tables'
+    if not schema_p.exists() or not tdir.exists():
+        return False
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        if out_path.exists():
+            out_path.unlink()
+        con = sqlite3.connect(str(out_path))
+        cur = con.cursor()
+        schema = schema_p.read_text(encoding='utf-8')
+        stmts = re.findall(r'(?is)CREATE\s+(?:TABLE|VIEW).*?;', schema)
+        created = 0
+        for s in stmts:
+            s2 = re.sub(r'\bAUTOINCREMENT\b', '', s, flags=re.I)
+            try:
+                cur.execute(s2)
+                created += 1
+            except sqlite3.Error:
+                continue
+        total = 0
+        for csvp in sorted(tdir.glob('*.csv')):
+            tname = csvp.stem
+            coltypes = {}
+            try:
+                for (nm, typ, *_) in cur.execute('PRAGMA table_info("%s")' % tname.replace('"', '""')).fetchall():
+                    coltypes[nm] = (typ or '').upper()
+            except sqlite3.Error:
+                pass
+            with open(str(csvp), 'r', newline='', encoding='utf-8') as f:
+                rd = csv.reader(f)
+                try:
+                    cols = next(rd)
+                except StopIteration:
+                    continue
+                if not cols:
+                    continue
+                place = ','.join('?' * len(cols))
+                q = 'INSERT INTO "%s" (%s) VALUES (%s)' % (tname.replace('"', '""'), ','.join('"%s"' % c.replace('"', '""') for c in cols), place)
+                n = 0
+                for row in rd:
+                    if len(row) != len(cols):
+                        continue
+                    vals = []
+                    for c, v in zip(cols, row):
+                        t = coltypes.get(c, '')
+                        if t.startswith('INTEGER') or t.startswith('BIG') or t.startswith('TINY') or t.startswith('SMALL'):
+                            vals.append(int(v) if v.strip() else 0)
+                        elif t.startswith('REAL') or t.startswith('FLOAT') or t.startswith('DOUBLE') or t.startswith('NUMERIC'):
+                            vals.append(float(v) if v.strip() else 0.0)
+                        elif v == '':
+                            vals.append(None)
+                        elif isinstance(v, str) and v.startswith('\\x'):
+                            try:
+                                vals.append(bytes.fromhex(v[2:]))
+                            except Exception:
+                                vals.append(v)
+                        else:
+                            vals.append(v)
+                    try:
+                        cur.execute(q, vals)
+                        n += 1
+                    except sqlite3.Error:
+                        continue
+                total += n
+        con.commit()
+        con.close()
+        print('   [sqlite rebuild] tables=%d rows=%d -> %s' % (created, total, out_path.name))
+        return True
+    except Exception:
+        try:
+            con.close()
+        except Exception:
+            pass
         return False
 
 # ==================== LUA REPEAT-XOR (MULTI-BYTE KEY) BREAKER ====================
@@ -1107,13 +1194,25 @@ def _lua_report(kind: str, data: bytes) -> List[str]:
     lines = []
     if kind == 'LUJIT':
         ver = data[3] if len(data) > 3 else 0
-        lines.append('LuaJIT bytecode detected (LJ version 0x%02x, likely %s).' % (ver, '2.1' if ver == 1 else '2.0'))
-        lines.append('NOTE: LuaJIT chunks are usually LJC-compressed (zlib stream after header).')
-        lines.append('Strings table below; disassembly of compressed LuaJIT requires full LJC decompressor.')
+        flags = data[4] if len(data) > 4 else 0
+        if ver == 0x01 and data[:4] == b'\x1bLJ':
+            label = 'LuaJIT 2.0'
+        elif ver == 0x02:
+            label = 'LuaJIT 2.1 (debug build)'
+        elif ver == 0x03:
+            label = 'LuaJIT 2.1 (release)'
+        else:
+            label = 'LuaJIT %d' % (ver >> 1)
+        lines.append('%s bytecode detected (LJ version byte 0x%02x, flags 0x%02x).' % (label, ver, flags))
+        big = flags & 0x01
+        lines.append('Endianness: %s | flags bits: BE=0x01 HHFLOAT=0x02 FFI=0x04' % ('BIG' if big else 'little'))
+        lines.append('Bottom line: bytecode instructions are LJ-encoded (register VM) — readable listing needs a matching LuaJIT build.')
+        lines.append('String table below is 100%% reliable; size/entry layout after header is compiler-specific.')
     elif kind in ('LUA52', 'LUA53', 'LUA54'):
         ver = {0x52: '5.2', 0x53: '5.3', 0x54: '5.4'}.get(data[4] if len(data) > 4 else 0, '5.x')
         lines.append('Lua %s bytecode detected (header parsed).' % ver)
-        lines.append('NOTE: full %s decompiler requires per-version opcode/varint tables; strings table below for auditing.' % ver)
+        lines.append('%s instruction words are packed (varint per op in 5.3/5.4); readable listing needs a %s decompiler.' % (ver, ver))
+        lines.append('String/constant table below is 100%% reliable for audit and same-length patching.')
     return lines
 
 def _process_lua_file(data: bytes, dest_dir: Path, base_name: str, full: bool = False):
@@ -1157,6 +1256,33 @@ def _process_lua_file(data: bytes, dest_dir: Path, base_name: str, full: bool = 
     main.write_text('\n'.join(body_lines), encoding='utf-8')
     (dest_dir / 'meta.json').write_text(json.dumps({'type': kind, 'xor_key': xor_key, 'prefix': prefix_len, 'full': full}))
 
+    strings = _extract_strings_clean(cleaned, 4)
+    seen = set()
+    top = []
+    for s in strings:
+        if s not in seen:
+            seen.add(s); top.append(s)
+        if len(top) >= 300:
+            break
+    if full:
+        try:
+            tpl = {
+                '_how': 'Repack (option 7 / 9) applies SAME-LENGTH byte swaps on the decrypted chunk. Edit a value but KEEP its length (pad with spaces); repair lengths are dropped. Save as patch.json in this folder, then repack. Unchanged lines are skipped.',
+                'swap': {s: s for s in top}
+            }
+            (dest_dir / 'patch_example.json').write_text(json.dumps(tpl, ensure_ascii=False, indent=1), encoding='utf-8')
+        except Exception:
+            pass
+    elif top:
+        body_lines.append('')
+        body_lines.append('-- HOW TO PATCH WITHOUT TOUCHING THE GAME:')
+        body_lines.append('-- 1) create patch.json in this folder: {"swap": {"OLD": "NEW"}}')
+        body_lines.append('-- 2) NEW length must be <= OLD length (pad with spaces). Repack auto-applies.')
+        body_lines.append('-- sample strings found in this chunk:')
+        for s in top[:14]:
+            body_lines.append('--   "%s"' % s[:80])
+        main.write_text('\n'.join(body_lines), encoding='utf-8')
+
     if full:
         # Rich mode: sidecar audit files (option 7 asks for these)
         if kind == 'LUA51':
@@ -1173,8 +1299,17 @@ def _process_lua_file(data: bytes, dest_dir: Path, base_name: str, full: bool = 
                 pass
         (dest_dir / 'strings_readable.txt').write_text('\n'.join(_extract_strings_clean(cleaned)), encoding='utf-8')
 
-def _extract_strings_clean(data: bytes):
-    return [m.group(0).decode('ascii', errors='replace') for m in re.finditer(rb'[\x20-\x7e]{3,}', data)]
+def _extract_strings_clean(data: bytes, min_len: int = 3):
+    try:
+        text = data.decode('utf-8')
+    except Exception:
+        return [m.group(0).decode('ascii', 'replace') for m in re.finditer(rb'[\x20-\x7e]{%d,}' % min_len, data)]
+    out = []
+    for m in re.finditer(r'[\x20-\x7e\u00a0-\ufffd]{%d,}' % max(2, min_len - 1), text):
+        s = m.group(0)
+        if '\n' not in s and '\r' not in s and '\t' not in s:
+            out.append(s)
+    return out
 
 def _repack_lua(dest_dir: Path, base_name: str, out_path: Path) -> bool:
     raw = dest_dir / ('%s.raw' % str(base_name))
@@ -1182,17 +1317,30 @@ def _repack_lua(dest_dir: Path, base_name: str, out_path: Path) -> bool:
         return False
     raw_bytes = raw.read_bytes()
     payload, key, prefix = _unscramble_lua(raw_bytes)
+    applied = 0
+    skipped = 0
 
     patch_f = dest_dir / 'patch.json'
     if patch_f.exists():
         try:
             pat = json.loads(patch_f.read_text())
-            for old, new in pat.items():
+            swap = pat.get('swap', pat) if isinstance(pat, dict) else {}
+            if not isinstance(swap, dict):
+                swap = {}
+            for old, new in swap.items():
+                if not isinstance(old, str) or not isinstance(new, str):
+                    continue
+                if old == new:
+                    continue
                 old_b = old.encode('utf-8'); new_b = new.encode('utf-8')
-                if len(old_b) == len(new_b):
+                if len(new_b) > len(old_b):
+                    skipped += 1
+                    continue
+                if len(new_b) == len(old_b):
                     payload = payload.replace(old_b, new_b)
-                elif len(new_b) < len(old_b):
+                else:
                     payload = payload.replace(old_b, new_b + b'\x00' * (len(old_b) - len(new_b)))
+                applied += 1
         except Exception:
             pass
 
@@ -1206,6 +1354,8 @@ def _repack_lua(dest_dir: Path, base_name: str, out_path: Path) -> bool:
         rebuild = raw_bytes[:prefix] + rebuild
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(rebuild)
+    if applied or skipped:
+        print('   [lua patch] applied=%d skipped(zu lang/grew)=%d' % (applied, skipped))
     return True
 
 # ==================== REPACK ENGINE (FULL IN-PLACE REBUILD, SAFE) ====================
@@ -1397,6 +1547,7 @@ def repack_pak_file_full(pak_file, edited_root, output_path, target_path=None, f
         rep = ['FRIEND TOOL — STEALTH REPACK REPORT', '='*46,
                'Source PAK   : %s' % (pak_file._pak_info.mp_name or ''),
                'Total blocks : %d -> %d' % (sum(len(e.compressed_blocks) for e in pak_file._files), sum(len(e.compressed_blocks) for e in new_files)),
+               'Files        : %d total | %d edited/rebuilt | %d carried byte-identical' % (len(pak_file._files), len(stealth_delta), len(pak_file._files) - len(stealth_delta)),
                'Size         : %d -> %d  (delta %+d bytes)' % (orig_total, new_total, new_total - orig_total)]
         if new_total == orig_total:
             rep.append('STATUS       : 🛡 BYPASS — exact same total size, game size-track defeated')
@@ -1459,11 +1610,14 @@ def pidx_check(pi) -> int:
 # ==================== UNIVERSAL DUMP & REPACK (ALL ASSETS) ====================
 
 def _curate_tree(root: Path):
-    """Park UI-noise artifacts (decoded-duplicates, temp copies) into root/_debug
-    so the dump stays ONE clean folder with the meaningful files only."""
+    """Keeps the dump folder clean: only the MEANINGFUL files stay in place
+    (readable assets + the .raw/original copies that repack needs).
+    Redundant derived sidecars (…cleaned, …raw.xml, strings_*.txt, blob_header)
+    are parked in <root>/_debug — they never get repacked and never clutter."""
     try:
         dbg = root / '_debug'
         dbg.mkdir(exist_ok=True)
+        waste = ('strings_readable.txt', 'strings.txt', 'blob_header.hex')
         for p in list(root.rglob('*')):
             if not p.is_file():
                 continue
@@ -1471,15 +1625,10 @@ def _curate_tree(root: Path):
             if rel.parts and rel.parts[0] in ('_debug', '__nested__'):
                 continue
             low = p.name.lower()
-            drop = (low.endswith('.cleaned') or low.endswith('.raw.xml')
-                    or low in ('original.bin', 'blob_header.hex', '_pack.bin', '_db_copy.db', 'strings_readable.txt', '_blob.bin'))
-            if drop:
+            if low in waste or low.endswith(('.cleaned', '.raw.xml')):
                 tgt = dbg.joinpath(*rel)
                 tgt.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(p), str(tgt))
-    except Exception:
-        pass
-    try:
         if dbg.exists() and not any(dbg.rglob('*')):
             dbg.rmdir()
     except Exception:
@@ -1593,6 +1742,8 @@ def _repack_universal(dump_dir: Path, result_dir: Path):
         return True, str(out_file)
 
     if dtype == 'SQLITE':
+        if _rebuild_sqlite(dump_dir, orig_name, out_file):
+            return True, str(out_file)
         src_bin = dump_dir / orig_name
         if src_bin.exists():
             shutil.copy2(src_bin, out_file)
@@ -1650,13 +1801,17 @@ def safe_input(p: str = '') -> str:
     try: return input(p)
     except: return ''
 
-def _pick_pak(base: Path):
+def _pick_pak(base: Path, allow_all: bool = True):
     files = list((base / "PAK").glob("*.pak"))
     if not files: return files, None
+    if len(files) > 1 and allow_all:
+        console.print("[dim]Multiple PAKs found — enter 0 to process ALL:[/dim]")
     for i, f in enumerate(files, 1): console.print(f"  {i}. {f.name}")
     try:
-        idx = int(safe_input('\nEnter number: ')) - 1
-        return files, files[idx]
+        idx = safe_input('\nEnter number: ').strip()
+        if idx == '0' and len(files) > 1 and allow_all:
+            return files, 'ALL'
+        return files, files[int(idx) - 1]
     except Exception:
         return files, None
 
@@ -1667,7 +1822,7 @@ def main_menu():
     while True:
         os.system('cls' if os.name == 'nt' else 'clear')
         console.print("[bold cyan]================================================[/bold cyan]")
-        console.print("[bold yellow]      FRIEND BGMI TOOL — ULTIMATE ENGINE        [/bold yellow]")
+        console.print("[bold yellow]      FRIEND BGMI TOOL — ULTRA ENGINE v4        [/bold yellow]")
         console.print("[bold cyan]================================================[/bold cyan]")
         console.print("[bold yellow]OWNER: @Friends6gg   |   TELEGRAM: @Friends6gg[/bold yellow]\n")
 
@@ -1689,22 +1844,34 @@ def main_menu():
         # 1. UNPACK PAK
         if c == '1':
             files, sel = _pick_pak(base)
-            if sel is None:
+            if files and sel == 'ALL':
+                done = 0
+                for f in files:
+                    try:
+                        pak = TencentPakFile(f)
+                        ok = pak.dump(base / "UNPACK" / f.stem)
+                        console.print(f"[green]✓ {f.name}: {ok} file(s) -> UNPACK/{f.stem}[/green]")
+                        done += ok
+                    except Exception as e:
+                        console.print(f"[red]✗ {f.name}: {e}[/red]")
+                console.print(f"\n[bold green]✅ Batch done: {len(files)} PAK(s), total {done} file(s) extracted[/bold green]")
+            elif sel is None:
                 console.print("[red]No .pak files found in PAK/[/red]"); safe_input('\nPress Enter...'); continue
-            try:
-                pak = TencentPakFile(sel)
-                out = base / "UNPACK" / sel.stem
-                ok = pak.dump(out)
-                console.print(f"\n[bold green]✅ Success! {ok} file(s) extracted (hash-verified) to UNPACK/{sel.stem}[/bold green]")
-                console.print("[dim]See UNPACK/<name>/STATUS.txt for per-file HASH_OK/SALVAGED status.[/dim]")
-            except Exception as e:
-                console.print(f"[bold red]❌ Error: {e}[/bold red]")
-                traceback.print_exc()
+            else:
+                try:
+                    pak = TencentPakFile(sel)
+                    out = base / "UNPACK" / sel.stem
+                    ok = pak.dump(out)
+                    console.print(f"\n[bold green]✅ Success! {ok} file(s) extracted (hash-verified) to UNPACK/{sel.stem}[/bold green]")
+                    console.print("[dim]See UNPACK/<name>/STATUS.txt for per-file HASH_OK/SALVAGED status.[/dim]")
+                except Exception as e:
+                    console.print(f"[bold red]❌ Error: {e}[/bold red]")
+                    traceback.print_exc()
             safe_input('\nPress Enter...')
 
         # 2. REPACK ALL TYPES
         elif c == '2':
-            files, sel = _pick_pak(base)
+            files, sel = _pick_pak(base, allow_all=False)
             if sel is None:
                 console.print("[red]No .pak files found in PAK/[/red]"); safe_input('\nPress Enter...'); continue
             try:
